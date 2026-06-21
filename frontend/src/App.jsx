@@ -1,8 +1,9 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import {
   Brain, Play, RefreshCw, Award, AlertCircle,
   ChevronRight, BookOpen, HelpCircle, Sparkles,
   TrendingUp, Target, CheckCircle2, XCircle,
+  Clock, Timer, AlarmClock, FileText,
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { GridBackground } from "./components/ui/GridBackground";
@@ -27,6 +28,17 @@ const EXPERIENCE_LEVELS = [
 ];
 
 const QUESTION_COUNTS = [5, 10, 15];
+
+const TIMER_MODES = [
+  { value: "none",      label: "Off",        icon: "⊘",  desc: "No timer" },
+  { value: "elapsed",   label: "Elapsed",    icon: "⏱",  desc: "Count up" },
+  { value: "countdown", label: "Countdown",  icon: "⏳", desc: "Time limit" },
+];
+const TIMER_DURATIONS = [
+  { secs: 20 * 60, label: "20 min" },
+  { secs: 30 * 60, label: "30 min" },
+  { secs: 60 * 60, label: "1 hr" },
+];
 
 // ---------- Helpers ----------
 
@@ -78,6 +90,57 @@ function CircularProgress({ score, size = 110 }) {
   );
 }
 
+// ---------- Interview Timer ----------
+
+function InterviewTimer({ mode, durationSecs, running, onExpire }) {
+  const [elapsed, setElapsed] = useState(0);
+  const intervalRef = useRef(null);
+
+  useEffect(() => {
+    setElapsed(0);
+  }, [running, mode]);
+
+  useEffect(() => {
+    if (mode === "none" || !running) {
+      clearInterval(intervalRef.current);
+      return;
+    }
+    intervalRef.current = setInterval(() => {
+      setElapsed(prev => {
+        if (mode === "countdown" && prev >= durationSecs - 1) {
+          clearInterval(intervalRef.current);
+          onExpire?.();
+          return durationSecs;
+        }
+        return prev + 1;
+      });
+    }, 1000);
+    return () => clearInterval(intervalRef.current);
+  }, [mode, running, durationSecs, onExpire]);
+
+  if (mode === "none") return null;
+
+  const displaySecs = mode === "countdown" ? Math.max(0, durationSecs - elapsed) : elapsed;
+  const mins = Math.floor(displaySecs / 60);
+  const secs = displaySecs % 60;
+  const fmt = `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+
+  const pct = mode === "countdown" ? displaySecs / durationSecs : null;
+  const isWarning = mode === "countdown" && displaySecs <= 300; // ≤5 min
+  const isDanger  = mode === "countdown" && displaySecs <= 60;  // ≤1 min
+
+  return (
+    <div className={`flex items-center gap-1.5 px-3 py-1 rounded-full border font-mono text-xs font-bold tabular-nums transition-all duration-500
+      ${isDanger  ? "border-red-500/50 bg-red-500/10 text-red-400 animate-pulse" :
+        isWarning ? "border-amber-500/50 bg-amber-500/10 text-amber-400" :
+                    "border-white/8 bg-zinc-900/60 text-zinc-300"}`}>
+      {mode === "elapsed" ? <Clock className="w-3 h-3 shrink-0" /> : <AlarmClock className="w-3 h-3 shrink-0" />}
+      {fmt}
+      {isDanger && <span className="ml-0.5 text-[9px] font-normal">TIME!</span>}
+    </div>
+  );
+}
+
 function OptionButton({ label, text, selected, disabled, onClick }) {
   return (
     <motion.button
@@ -125,6 +188,13 @@ export default function App() {
   const [difficulty, setDifficulty] = useState("Medium");
   const [experienceLevel, setExperienceLevel] = useState("Mid-Level");
   const [numQuestions, setNumQuestions] = useState(5);
+  const [description, setDescription] = useState("");
+  const [timerMode, setTimerMode] = useState("none");
+  const [timerDuration, setTimerDuration] = useState(30 * 60);
+
+  // Timer (interview screen)
+  const [timerRunning, setTimerRunning] = useState(false);
+  const [timerExpired, setTimerExpired] = useState(false);
 
   // Interview
   const [sessionId, setSessionId] = useState("");
@@ -188,7 +258,12 @@ export default function App() {
     try {
       const res = await apiCall("/start-interview", {
         method: "POST",
-        body: JSON.stringify({ subject, topic, difficulty, experience_level: experienceLevel, num_questions: numQuestions }),
+        body: JSON.stringify({
+          subject, topic, difficulty,
+          experience_level: experienceLevel,
+          num_questions: numQuestions,
+          description: description.trim() || null,
+        }),
       }, token);
       if (!res.ok) { const d = await res.json(); throw new Error(d.detail || "Failed to start session"); }
       const data = await res.json();
@@ -201,6 +276,8 @@ export default function App() {
       setAnswered(false);
       setPendingNext(null);
       setQuestionKey(0);
+      setTimerExpired(false);
+      setTimerRunning(true);
       setScreen("interview");
     } catch (err) {
       setErrorMsg(err.message || "An error occurred.");
@@ -258,6 +335,8 @@ export default function App() {
       if (!res.ok) { const d = await res.json(); throw new Error(d.detail || "Failed to fetch results"); }
       const data = await res.json();
       setResults(data);
+      setTimerRunning(false);
+      setTimerExpired(false);
       setScreen("results");
     } catch (err) {
       setErrorMsg(err.message || "Could not retrieve results.");
@@ -275,7 +354,14 @@ export default function App() {
     setResults(null);
     setErrorMsg("");
     setQuestionNumber(1);
+    setTimerRunning(false);
+    setTimerExpired(false);
+    setDescription("");
   };
+
+  const handleTimerExpire = useCallback(() => {
+    setTimerExpired(true);
+  }, []);
 
   // ---------- Loading screen ----------
 
@@ -462,6 +548,74 @@ export default function App() {
                     </div>
                   </div>
 
+                  {/* Timer */}
+                  <div className="space-y-2">
+                    <label className="text-xs font-bold uppercase tracking-wider text-zinc-400 font-mono flex items-center gap-2">
+                      <Clock className="w-3.5 h-3.5" /> Timer
+                    </label>
+                    <div className="flex gap-2">
+                      {TIMER_MODES.map((m) => (
+                        <motion.button
+                          key={m.value}
+                          onClick={() => setTimerMode(m.value)}
+                          whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}
+                          className={`flex-1 py-2.5 rounded-xl border text-sm font-bold transition-all duration-200 ${
+                            timerMode === m.value
+                              ? "border-indigo-500/60 bg-indigo-500/10 text-indigo-300"
+                              : "border-white/8 bg-zinc-900/60 text-zinc-400 hover:border-white/15 hover:text-zinc-200"
+                          }`}
+                        >
+                          <span className="block text-base">{m.icon}</span>
+                          {m.label}
+                          <span className="text-[10px] font-normal block text-zinc-500">{m.desc}</span>
+                        </motion.button>
+                      ))}
+                    </div>
+                    <AnimatePresence>
+                      {timerMode === "countdown" && (
+                        <motion.div
+                          initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }}
+                          exit={{ opacity: 0, height: 0 }} transition={{ duration: 0.2 }}
+                          className="flex gap-2 overflow-hidden"
+                        >
+                          {TIMER_DURATIONS.map((d) => (
+                            <motion.button
+                              key={d.secs}
+                              onClick={() => setTimerDuration(d.secs)}
+                              whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}
+                              className={`flex-1 py-2 rounded-xl border text-sm font-bold transition-all duration-200 ${
+                                timerDuration === d.secs
+                                  ? "border-amber-500/60 bg-amber-500/10 text-amber-300"
+                                  : "border-white/8 bg-zinc-900/60 text-zinc-400 hover:border-white/15 hover:text-zinc-200"
+                              }`}
+                            >
+                              {d.label}
+                            </motion.button>
+                          ))}
+                        </motion.div>
+                      )}
+                    </AnimatePresence>
+                  </div>
+
+                  {/* Description / Focus */}
+                  <div className="space-y-2">
+                    <label className="text-xs font-bold uppercase tracking-wider text-zinc-400 font-mono flex items-center gap-2">
+                      <FileText className="w-3.5 h-3.5" /> Focus Area <span className="text-zinc-600 normal-case font-normal tracking-normal">optional</span>
+                    </label>
+                    <textarea
+                      value={description}
+                      onChange={(e) => { setDescription(e.target.value); setErrorMsg(""); }}
+                      maxLength={400}
+                      rows={3}
+                      placeholder="e.g. Focus on React hooks, especially useEffect and useCallback edge cases. I'm preparing for a system design round."
+                      className="w-full px-4 py-3 rounded-xl border border-white/8 bg-zinc-900/60 text-zinc-200 placeholder-zinc-600 text-sm resize-none focus:outline-none focus:border-indigo-500/50 focus:bg-zinc-900/80 transition-all duration-200"
+                    />
+                    <p className="text-[11px] text-zinc-600 flex justify-between">
+                      <span>Tailor questions to your specific sub-topic or scenario</span>
+                      <span className={description.length > 350 ? "text-amber-500" : ""}>{description.length}/400</span>
+                    </p>
+                  </div>
+
                   <div className="pt-1">
                     <HoverBorderGradient onClick={handleStartInterview} containerClassName="w-full" disabled={loading}>
                       <span className="flex items-center justify-center gap-2">
@@ -479,6 +633,34 @@ export default function App() {
             <motion.div key="interview" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -20 }} transition={{ duration: 0.35 }}
               className="max-w-2xl mx-auto w-full space-y-5">
 
+              {/* Time-expired overlay */}
+              <AnimatePresence>
+                {timerExpired && (
+                  <motion.div
+                    initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }}
+                    exit={{ opacity: 0 }} transition={{ duration: 0.25 }}
+                    className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm"
+                  >
+                    <div className="bg-zinc-900 border border-red-500/30 rounded-2xl p-8 max-w-sm w-full mx-4 text-center space-y-4 shadow-2xl">
+                      <div className="text-5xl">⏰</div>
+                      <h2 className="text-xl font-extrabold text-white">Time's Up!</h2>
+                      <p className="text-sm text-zinc-400">Your allotted time has ended. Submit your current answer to see your results.</p>
+                      <div className="flex flex-col gap-2 pt-2">
+                        {selectedOption && !answered && (
+                          <HoverBorderGradient onClick={() => { handleSubmitAnswer(); setTimerExpired(false); }} containerClassName="w-full">
+                            <span className="flex items-center justify-center gap-2"><Target className="w-4 h-4" /> Submit & See Results</span>
+                          </HoverBorderGradient>
+                        )}
+                        <button onClick={() => setTimerExpired(false)}
+                          className="text-xs text-zinc-500 hover:text-zinc-300 transition-colors py-2">
+                          Dismiss — keep going
+                        </button>
+                      </div>
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+
               {/* Breadcrumb */}
               <div className="flex flex-wrap items-center justify-between gap-3 bg-zinc-900/40 px-4 py-2.5 rounded-2xl border border-white/5">
                 <div className="flex items-center gap-1.5 text-xs text-zinc-400">
@@ -490,9 +672,17 @@ export default function App() {
                     {difficulty}
                   </span>
                 </div>
-                <span className="text-xs font-mono font-bold bg-zinc-800 text-zinc-300 px-3 py-1 rounded-full border border-white/5">
-                  {questionNumber} / {totalQuestions}
-                </span>
+                <div className="flex items-center gap-2">
+                  <InterviewTimer
+                    mode={timerMode}
+                    durationSecs={timerDuration}
+                    running={timerRunning}
+                    onExpire={handleTimerExpire}
+                  />
+                  <span className="text-xs font-mono font-bold bg-zinc-800 text-zinc-300 px-3 py-1 rounded-full border border-white/5">
+                    {questionNumber} / {totalQuestions}
+                  </span>
+                </div>
               </div>
 
               {/* Progress */}
