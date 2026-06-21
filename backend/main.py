@@ -1,12 +1,22 @@
 import uuid
+import os
+import json
+import random
+import bcrypt
+import psycopg2
+import psycopg2.extras
+import resend
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException
+from datetime import datetime, timedelta, timezone
+from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from openai import OpenAI
 
-app = FastAPI(title="AI Interview Taker MVP API")
+resend.api_key = os.environ.get("RESEND_API_KEY", "")
 
-# Enable CORS for frontend local development
+app = FastAPI(title="InterviewerAI API")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -15,65 +25,136 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory session store
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+# ---------- DB helpers ----------
+
+def get_db():
+    conn = psycopg2.connect(os.environ["DATABASE_URL"])
+    conn.autocommit = False
+    return conn
+
+
+def db_fetchone(query: str, params=None):
+    conn = get_db()
+    try:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(query, params)
+        row = cur.fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def db_fetchall(query: str, params=None):
+    conn = get_db()
+    try:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(query, params)
+        rows = cur.fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def db_execute(query: str, params=None):
+    conn = get_db()
+    try:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(query, params)
+        conn.commit()
+        try:
+            return dict(cur.fetchone()) if cur.rowcount > 0 else None
+        except Exception:
+            return None
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        conn.close()
+
+
+def db_execute_returning(query: str, params=None):
+    conn = get_db()
+    try:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(query, params)
+        conn.commit()
+        row = cur.fetchone()
+        return dict(row) if row else None
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        conn.close()
+
+
+# ---------- In-memory sessions ----------
+
 sessions = {}
 
-# Mock questions for different combinations
-MOCK_QUESTIONS_POOL = {
-    ("Frontend", "React"): [
-        "What is the purpose of state in React, and how does it differ from props?",
-        "What are React Hooks, and what rules must you follow when using them?",
-        "Explain the Virtual DOM and how React reconciles updates to the real DOM.",
-        "How does the useEffect hook work, and how do you clean up side effects in it?",
-        "What is the difference between controlled and uncontrolled components in React?"
-    ],
-    ("Frontend", "JavaScript"): [
-        "What is the difference between 'let', 'const', and 'var' in JavaScript?",
-        "Explain the concept of closures in JavaScript and provide a practical use case.",
-        "What is the difference between '==' and '===' operators in JavaScript?",
-        "Explain how the JavaScript Event Loop works and how it handles asynchronous operations.",
-        "What are Promises, and how do they compare to async/await syntax?"
-    ],
-    ("Frontend", "CSS"): [
-        "What is the difference between Flexbox and CSS Grid layout systems?",
-        "Explain the CSS Box Model and how 'box-sizing: border-box' affects it.",
-        "What are CSS custom properties (variables) and how do they differ from preprocessor variables?",
-        "Explain CSS specificity and how the cascade determines styling application rules.",
-        "What is the purpose of media queries and how do you implement mobile-first design?"
-    ],
-    ("Backend", "Node.js"): [
-        "Explain the single-threaded event loop architecture of Node.js.",
-        "What is the difference between 'require' (CommonJS) and 'import' (ES Modules) in Node.js?",
-        "How does middleware work in Express, and what is its role in request processing?",
-        "What is the difference between stream-based and buffer-based file processing in Node.js?",
-        "Explain how error handling is typically implemented in asynchronous Node.js operations."
-    ],
-    ("Backend", "Databases"): [
-        "What is the difference between SQL and NoSQL databases, and when would you use each?",
-        "Explain the ACID properties of relational database transactions.",
-        "What is database indexing, and how does it improve query performance? Are there downsides?",
-        "Explain the difference between inner join, left join, and outer join in SQL.",
-        "What is database normalization, and why is it important in relational database design?"
-    ]
-}
 
-DEFAULT_MOCK_QUESTIONS = [
-    "What is the primary technical concept behind this topic, and why is it important?",
-    "Explain a common problem or challenge associated with this topic and how you would solve it.",
-    "Describe the difference between two competing approaches or features in this area.",
-    "How do you optimize or write efficient code/systems related to this topic?",
-    "Explain how you would debug or troubleshoot an issue related to this topic."
-]
+# ---------- Auth helpers ----------
 
-# Request/Response Pydantic Models
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+
+def verify_password(password: str, hashed: str) -> bool:
+    return bcrypt.checkpw(password.encode(), hashed.encode())
+
+
+def create_session_token(user_id: int) -> str:
+    token = str(uuid.uuid4())
+    expires = datetime.now(timezone.utc) + timedelta(days=30)
+    db_execute(
+        "INSERT INTO user_sessions (user_id, token, expires_at) VALUES (%s, %s, %s)",
+        (user_id, token, expires)
+    )
+    return token
+
+
+def get_current_user(authorization: Optional[str] = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    token = authorization.split(" ", 1)[1]
+    row = db_fetchone(
+        """SELECT u.id, u.name, u.email
+           FROM user_sessions s
+           JOIN users u ON u.id = s.user_id
+           WHERE s.token = %s AND s.expires_at > NOW()""",
+        (token,)
+    )
+    if not row:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+    return row
+
+
+# ---------- Pydantic models ----------
+
+class RequestOTPRequest(BaseModel):
+    email: str
+    name: Optional[str] = None
+
+class VerifyOTPRequest(BaseModel):
+    email: str
+    otp_code: str
+
+class AuthResponse(BaseModel):
+    token: str
+    user: dict
+
 class StartInterviewRequest(BaseModel):
     subject: str
     topic: str
     difficulty: str
+    experience_level: str = "Mid-Level"
+    num_questions: int = 5
 
 class StartInterviewResponse(BaseModel):
     session_id: str
     question: str
+    options: List[str]
     question_number: int
     total_questions: int
 
@@ -82,51 +163,275 @@ class SubmitAnswerRequest(BaseModel):
     answer: str
 
 class SubmitAnswerResponse(BaseModel):
-    score: int
-    feedback: str
     done: bool
     next_question: Optional[str] = None
+    next_options: Optional[List[str]] = None
     question_number: int
     total_questions: int
 
 class QuestionDetail(BaseModel):
     question: str
-    answer: str
+    options: List[str]
+    user_answer: str
+    correct_answer: str
+    is_correct: bool
+    explanation: str
     score: int
-    feedback: str
 
 class ResultsResponse(BaseModel):
+    assessment_id: int
+    subject: str
+    topic: str
+    difficulty: str
+    experience_level: str
+    num_questions: int
+    overall_score: float
+    ai_feedback: str
+    questions: List[QuestionDetail]
+
+class AssessmentSummary(BaseModel):
+    id: int
     subject: str
     topic: str
     difficulty: str
     overall_score: float
-    questions: List[QuestionDetail]
+    question_count: int
+    correct_count: int
+    completed_at: Optional[str]
+    created_at: str
 
+
+# ---------- AI helpers ----------
+
+def generate_mcq_questions(subject: str, topic: str, difficulty: str,
+                            experience_level: str = "Mid-Level", num_questions: int = 5) -> list:
+    experience_guidance = {
+        "Junior":    "Use foundational concepts, clear terminology, practical beginner scenarios. Avoid advanced internals.",
+        "Mid-Level": "Cover intermediate concepts, real-world trade-offs, common patterns and pitfalls.",
+        "Senior":    "Focus on advanced internals, architectural decisions, edge cases, performance, and system design nuances.",
+    }.get(experience_level, "Cover intermediate concepts and real-world trade-offs.")
+
+    prompt = f"""You are an expert technical interviewer. Generate exactly {num_questions} multiple choice questions for a technical assessment.
+
+Subject: {subject}
+Topic: {topic}
+Difficulty: {difficulty}
+Experience Level: {experience_level}
+Experience guidance: {experience_guidance}
+
+Requirements:
+- Questions must be technically accurate and industry-level
+- Each question has exactly 4 options
+- Options must be randomly ordered — the correct answer must NOT always appear at the same position across questions
+- Distractors must be plausible but clearly wrong on reflection
+- Explanations must be detailed and educational
+- Strictly match the {difficulty} difficulty AND {experience_level} experience level
+
+Return ONLY a valid JSON array with exactly {num_questions} objects. Each object must follow this exact structure:
+{{
+  "question": "Question text here",
+  "options": ["Option text 1", "Option text 2", "Option text 3", "Option text 4"],
+  "correctAnswer": "The exact text of the correct option (must match one of the options exactly)",
+  "explanation": "Detailed explanation of why this answer is correct and why the others are wrong"
+}}
+
+No markdown, no code fences, no extra text — just the raw JSON array."""
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.8,
+        max_tokens=max(3000, num_questions * 600),
+    )
+    raw = response.choices[0].message.content.strip()
+    if raw.startswith("```"):
+        parts = raw.split("```")
+        raw = parts[1] if len(parts) > 1 else parts[0]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    questions = json.loads(raw.strip())
+
+    # Shuffle options on our side too to ensure randomness
+    for q in questions:
+        correct = q["correctAnswer"]
+        opts = q["options"][:]
+        random.shuffle(opts)
+        # Guarantee correctAnswer is still in options
+        if correct not in opts:
+            # Replace a random wrong option with the correct one
+            opts[random.randint(0, 3)] = correct
+        q["options"] = opts
+        q["correctAnswer"] = correct
+
+    return questions
+
+
+def generate_ai_feedback(subject: str, topic: str, difficulty: str, qa_log: list,
+                          experience_level: str = "Mid-Level") -> str:
+    correct_count = sum(1 for q in qa_log if q["is_correct"])
+    total = len(qa_log)
+    summary_lines = []
+    for i, qa in enumerate(qa_log):
+        summary_lines.append(
+            f"Q{i+1}: {qa['question']}\n"
+            f"User answered: {qa['user_answer']}\n"
+            f"Correct answer: {qa['correct_answer']}\n"
+            f"Result: {'Correct' if qa['is_correct'] else 'Incorrect'}"
+        )
+
+    prompt = f"""You are a senior technical mentor reviewing a {experience_level} developer's assessment.
+The student completed a {difficulty} {topic} ({subject}) assessment, scoring {correct_count}/{total}.
+
+Results:
+{chr(10).join(summary_lines)}
+
+Write 3-4 sentences of personalized, constructive feedback tailored to a {experience_level} developer:
+1. Acknowledge their performance honestly
+2. Mention specific strong areas based on correct answers
+3. Point out specific gaps based on incorrect answers
+4. Give one concrete, level-appropriate study recommendation
+
+Write in second person ("You..."). Be encouraging but direct. No bullet points — flowing prose only."""
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.6,
+        max_tokens=300,
+    )
+    return response.choices[0].message.content.strip()
+
+
+# ---------- Auth routes ----------
+
+@app.post("/auth/request-otp")
+def request_otp(payload: RequestOTPRequest):
+    email = payload.email.lower().strip()
+    if not email:
+        raise HTTPException(status_code=400, detail="Email is required")
+
+    existing_user = db_fetchone("SELECT id, name FROM users WHERE email = %s", (email,))
+
+    # Sign-up flow: name required if user doesn't exist
+    if not existing_user:
+        if not payload.name or not payload.name.strip():
+            raise HTTPException(status_code=400, detail="No account found with this email. Switch to Create Account to sign up.")
+        # Create the new user (no password)
+        existing_user = db_execute_returning(
+            "INSERT INTO users (name, email) VALUES (%s, %s) RETURNING id, name, email",
+            (payload.name.strip(), email)
+        )
+
+    # Invalidate any existing unused OTPs for this email
+    db_execute(
+        "UPDATE otp_verifications SET used = TRUE WHERE email = %s AND used = FALSE",
+        (email,)
+    )
+
+    # Generate a 6-digit OTP
+    otp_code = str(random.randint(100000, 999999))
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=15)
+
+    db_execute(
+        "INSERT INTO otp_verifications (email, otp_code, expires_at) VALUES (%s, %s, %s)",
+        (email, otp_code, expires_at)
+    )
+
+    # Send OTP via Resend
+    try:
+        resend.Emails.send({
+            "from": "InterviewerAI <onboarding@resend.dev>",
+            "to": [email],
+            "subject": "Your InterviewerAI login code",
+            "html": f"""
+            <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:32px;background:#09090b;color:#f4f4f5;border-radius:16px">
+              <h2 style="margin:0 0 8px;font-size:22px;color:#ffffff">🔐 Your OTP Code</h2>
+              <p style="color:#a1a1aa;margin:0 0 24px;font-size:14px">Use this code to sign in to InterviewerAI. It expires in <strong style="color:#f4f4f5">15 minutes</strong>.</p>
+              <div style="background:#18181b;border:1px solid #3f3f46;border-radius:12px;padding:24px;text-align:center;margin-bottom:24px">
+                <span style="font-size:40px;font-weight:900;letter-spacing:12px;font-family:monospace;color:#818cf8">{otp_code}</span>
+              </div>
+              <p style="color:#71717a;font-size:12px;margin:0">If you didn't request this, you can safely ignore this email.</p>
+            </div>
+            """,
+        })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to send OTP email: {str(e)}")
+
+    return {"message": "OTP sent to your email", "expires_in": 900}
+
+
+@app.post("/auth/verify-otp")
+def verify_otp(payload: VerifyOTPRequest):
+    email = payload.email.lower().strip()
+    code = payload.otp_code.strip()
+
+    row = db_fetchone(
+        """SELECT id FROM otp_verifications
+           WHERE email = %s AND otp_code = %s AND used = FALSE AND expires_at > NOW()
+           ORDER BY created_at DESC LIMIT 1""",
+        (email, code)
+    )
+    if not row:
+        raise HTTPException(status_code=401, detail="Invalid or expired OTP. Please request a new one.")
+
+    # Mark OTP as used
+    db_execute("UPDATE otp_verifications SET used = TRUE WHERE id = %s", (row["id"],))
+
+    user = db_fetchone("SELECT id, name, email FROM users WHERE email = %s", (email,))
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    token = create_session_token(user["id"])
+    return {"token": token, "user": {"id": user["id"], "name": user["name"], "email": user["email"]}}
+
+
+@app.post("/auth/logout")
+def logout(authorization: Optional[str] = Header(None)):
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.split(" ", 1)[1]
+        db_execute("DELETE FROM user_sessions WHERE token = %s", (token,))
+    return {"success": True}
+
+
+@app.get("/auth/me")
+def me(current_user=Depends(get_current_user)):
+    return current_user
+
+
+# ---------- Interview routes ----------
 
 @app.post("/start-interview", response_model=StartInterviewResponse)
-def start_interview(payload: StartInterviewRequest):
+def start_interview(payload: StartInterviewRequest, current_user=Depends(get_current_user)):
+    num_q = max(1, min(payload.num_questions, 20))
+    try:
+        questions = generate_mcq_questions(
+            payload.subject, payload.topic, payload.difficulty,
+            payload.experience_level, num_q
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate questions: {str(e)}")
+
     session_id = str(uuid.uuid4())
-    
-    key = (payload.subject, payload.topic)
-    questions = MOCK_QUESTIONS_POOL.get(key, DEFAULT_MOCK_QUESTIONS).copy()
-    
-    difficulty_prefix = f"[{payload.difficulty} level] "
-    questions = [difficulty_prefix + q for q in questions]
-    
     sessions[session_id] = {
+        "user_id": current_user["id"],
         "subject": payload.subject,
         "topic": payload.topic,
         "difficulty": payload.difficulty,
+        "experience_level": payload.experience_level,
+        "num_questions": num_q,
         "current_index": 0,
         "questions": questions,
-        "qa_log": []
+        "qa_log": [],
+        "saved_assessment_id": None,
     }
-    
+
+    first_q = questions[0]
     return StartInterviewResponse(
         session_id=session_id,
-        question=questions[0],
+        question=first_q["question"],
+        options=first_q["options"],
         question_number=1,
-        total_questions=5
+        total_questions=num_q,
     )
 
 
@@ -135,84 +440,199 @@ def submit_answer(payload: SubmitAnswerRequest):
     session_id = payload.session_id
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
-        
+
     session = sessions[session_id]
     current_index = session["current_index"]
     questions = session["questions"]
-    
-    if current_index >= 5:
-        raise HTTPException(status_code=400, detail="Interview is already completed")
-        
-    current_question = questions[current_index]
-    
-    answer_len = len(payload.answer.strip())
-    if answer_len == 0:
-        score = 0
-        feedback = "You did not provide an answer. Please attempt the question next time to receive credit."
-    elif answer_len < 15:
-        score = 4
-        feedback = f"Your answer is too short. At the {session['difficulty']} difficulty level, we expect a more detailed explanation of the concepts."
-    else:
-        score = 6 + (answer_len % 5)
-        score = min(score, 10)
-        feedback = (
-            f"Good effort. Your response correctly identifies some core aspects. "
-            f"Under {session['difficulty']} criteria, you could improve by elaborating on edge cases and deep-dive mechanics."
-        )
-        
+
+    num_questions = session.get("num_questions", 5)
+    if current_index >= num_questions:
+        raise HTTPException(status_code=400, detail="Interview already completed")
+
+    current_q = questions[current_index]
+    correct_answer = current_q["correctAnswer"]
+    explanation = current_q["explanation"]
+    is_correct = payload.answer.strip() == correct_answer.strip()
+    score = 10 if is_correct else 0
+
     session["qa_log"].append({
-        "question": current_question,
-        "answer": payload.answer,
+        "question": current_q["question"],
+        "options": current_q["options"],
+        "user_answer": payload.answer,
+        "correct_answer": correct_answer,
+        "is_correct": is_correct,
         "score": score,
-        "feedback": feedback
+        "explanation": explanation,
     })
-    
+
     session["current_index"] += 1
     next_index = session["current_index"]
-    done = next_index >= 5
-    
+    done = next_index >= num_questions
+
     next_question = None
+    next_options = None
     if not done:
-        next_question = questions[next_index]
-        
+        next_q = questions[next_index]
+        next_question = next_q["question"]
+        next_options = next_q["options"]
+
     return SubmitAnswerResponse(
-        score=score,
-        feedback=feedback,
         done=done,
         next_question=next_question,
-        question_number=next_index + 1 if not done else 5,
-        total_questions=5
+        next_options=next_options,
+        question_number=next_index + 1 if not done else num_questions,
+        total_questions=num_questions,
     )
 
 
 @app.get("/results/{session_id}", response_model=ResultsResponse)
-def get_results(session_id: str):
+def get_results(session_id: str, current_user=Depends(get_current_user)):
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
-        
+
     session = sessions[session_id]
+    if session["user_id"] != current_user["id"]:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
     qa_log = session["qa_log"]
-    
-    if len(qa_log) == 0:
-        overall_score = 0.0
+    overall_score = round(sum(q["score"] for q in qa_log) / max(len(qa_log), 1), 1)
+
+    exp_level = session.get("experience_level", "Mid-Level")
+    num_questions = session.get("num_questions", 5)
+
+    # Generate AI feedback
+    try:
+        ai_feedback = generate_ai_feedback(
+            session["subject"], session["topic"], session["difficulty"], qa_log, exp_level
+        )
+    except Exception:
+        ai_feedback = "Assessment complete. Review your answers below to identify areas for improvement."
+
+    # Save to DB (idempotent — only once per session)
+    if not session.get("saved_assessment_id"):
+        conn = get_db()
+        try:
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute(
+                """INSERT INTO assessments (user_id, subject, topic, difficulty, experience_level, num_questions, overall_score, ai_feedback, completed_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW()) RETURNING id""",
+                (session["user_id"], session["subject"], session["topic"],
+                 session["difficulty"], exp_level, num_questions, overall_score, ai_feedback)
+            )
+            assessment_id = cur.fetchone()["id"]
+            for i, q in enumerate(qa_log):
+                cur.execute(
+                    """INSERT INTO assessment_questions
+                       (assessment_id, question_number, question, options, user_answer, correct_answer, is_correct, explanation, score)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (assessment_id, i + 1, q["question"], json.dumps(q["options"]),
+                     q["user_answer"], q["correct_answer"], q["is_correct"],
+                     q["explanation"], q["score"])
+                )
+            conn.commit()
+            session["saved_assessment_id"] = assessment_id
+        except Exception as e:
+            conn.rollback()
+            assessment_id = session.get("saved_assessment_id", 0)
+        finally:
+            conn.close()
     else:
-        overall_score = round(sum(q["score"] for q in qa_log) / len(qa_log), 1)
-        
+        assessment_id = session["saved_assessment_id"]
+
     return ResultsResponse(
+        assessment_id=assessment_id,
         subject=session["subject"],
         topic=session["topic"],
         difficulty=session["difficulty"],
+        experience_level=exp_level,
+        num_questions=num_questions,
         overall_score=overall_score,
+        ai_feedback=ai_feedback,
         questions=[
             QuestionDetail(
                 question=q["question"],
-                answer=q["answer"],
+                options=q["options"],
+                user_answer=q["user_answer"],
+                correct_answer=q["correct_answer"],
+                is_correct=q["is_correct"],
+                explanation=q["explanation"],
                 score=q["score"],
-                feedback=q["feedback"]
             )
             for q in qa_log
-        ]
+        ],
     )
+
+
+# ---------- Dashboard routes ----------
+
+@app.get("/dashboard")
+def dashboard(current_user=Depends(get_current_user)):
+    assessments = db_fetchall(
+        """SELECT a.id, a.subject, a.topic, a.difficulty, a.overall_score,
+                  a.completed_at, a.created_at,
+                  COUNT(aq.id) AS question_count,
+                  SUM(CASE WHEN aq.is_correct THEN 1 ELSE 0 END) AS correct_count
+           FROM assessments a
+           LEFT JOIN assessment_questions aq ON aq.assessment_id = a.id
+           WHERE a.user_id = %s
+           GROUP BY a.id
+           ORDER BY a.created_at DESC""",
+        (current_user["id"],)
+    )
+    result = []
+    for a in assessments:
+        result.append({
+            "id": a["id"],
+            "subject": a["subject"],
+            "topic": a["topic"],
+            "difficulty": a["difficulty"],
+            "overall_score": float(a["overall_score"]),
+            "question_count": a["question_count"],
+            "correct_count": int(a["correct_count"] or 0),
+            "completed_at": a["completed_at"].isoformat() if a["completed_at"] else None,
+            "created_at": a["created_at"].isoformat(),
+        })
+    return {"assessments": result, "user": current_user}
+
+
+@app.get("/assessments/{assessment_id}")
+def get_assessment(assessment_id: int, current_user=Depends(get_current_user)):
+    assessment = db_fetchone(
+        "SELECT * FROM assessments WHERE id = %s AND user_id = %s",
+        (assessment_id, current_user["id"])
+    )
+    if not assessment:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+
+    questions = db_fetchall(
+        "SELECT * FROM assessment_questions WHERE assessment_id = %s ORDER BY question_number",
+        (assessment_id,)
+    )
+    qs = []
+    for q in questions:
+        opts = q["options"] if isinstance(q["options"], list) else json.loads(q["options"])
+        qs.append({
+            "question": q["question"],
+            "options": opts,
+            "user_answer": q["user_answer"],
+            "correct_answer": q["correct_answer"],
+            "is_correct": q["is_correct"],
+            "explanation": q["explanation"],
+            "score": q["score"],
+        })
+
+    return {
+        "id": assessment["id"],
+        "subject": assessment["subject"],
+        "topic": assessment["topic"],
+        "difficulty": assessment["difficulty"],
+        "overall_score": float(assessment["overall_score"]),
+        "ai_feedback": assessment["ai_feedback"],
+        "completed_at": assessment["completed_at"].isoformat() if assessment["completed_at"] else None,
+        "created_at": assessment["created_at"].isoformat(),
+        "questions": qs,
+    }
+
 
 if __name__ == "__main__":
     import uvicorn

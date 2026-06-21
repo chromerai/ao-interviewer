@@ -1,0 +1,221 @@
+Enhancement Request: AI-Powered Dynamic Assessment Platform
+Objective
+Upgrade the existing assessment platform by introducing AI-generated questions, enhanced user engagement through rich micro-interactions, and a scalable architecture that supports future question types.
+
+AI Question Generation
+Requirements
+Instead of storing all questions statically in the database, integrate Google Gemini API to dynamically generate questions based on:
+Skill Category
+Difficulty Level
+Topic
+Experience Level
+Assessment Type
+Learning Objectives
+Current Scope
+For Version 1, generate only Multiple Choice Questions (MCQs).
+Each generated question must contain:
+{
+  "question": "Question text",
+  "options": [
+    "Option A",
+    "Option B",
+    "Option C",
+    "Option D"
+  ],
+  "correctAnswer": "Option B",
+  "explanation": "Detailed explanation",
+  "difficulty": "Easy | Medium | Hard",
+  "topic": "React Hooks"
+}
+
+Gemini Prompt Engineering
+When generating questions:
+Questions must be technically accurate.
+Avoid duplicate questions.
+Generate realistic industry-level scenarios.
+Include explanations for every answer.
+Ensure distractor options are meaningful.
+Match the requested difficulty level.
+Return structured JSON only.
+Question Generation Flow
+User starts assessment.
+System displays loading state.
+Gemini generates questions.
+Questions are cached locally.
+Assessment begins.
+Results are evaluated instantly.
+Future Extensibility
+Design architecture to support future question types:
+MCQ
+Multiple Select
+True/False
+Coding Challenges
+Fill in the Blank
+Drag and Drop
+Audio Questions
+Video Questions
+AI Interview Questions
+The architecture should be modular so new question types can be plugged in without major refactoring.
+
+User Experience Improvements
+The application currently feels static.
+Transform it into a highly interactive and modern AI-powered experience.
+
+AI Thinking Experience
+When Gemini is generating questions, do NOT show a boring spinner.
+Create an AI generation sequence:
+Stage 1
+"Analyzing skill requirements..."
+Animation:
+Neural network pulse effect
+Floating particles
+Stage 2
+"Generating assessment blueprint..."
+Animation:
+Progress nodes connecting
+AI brain visualization
+Stage 3
+"Crafting personalized questions..."
+Animation:
+Typing effect
+Streaming text effect
+Stage 4
+"Validating answer quality..."
+Animation:
+Scanning lines
+Matrix-style verification
+Stage 5
+"Finalizing assessment..."
+Animation:
+Progress completion
+Success transition
+
+Micro-Interactions
+Add rich micro-interactions throughout the application.
+Buttons
+Hover lift effect
+Soft glow effect
+Ripple click effect
+Smooth scaling
+Spring animations
+Cards
+Hover elevation
+Border glow
+Magnetic cursor effect
+Smooth transitions
+Question Selection
+When selecting an answer:
+Animated radio selection
+Success pulse
+Color transition
+Soft bounce effect
+Navigation
+Animated page transitions
+Slide transitions
+Fade transitions
+Progress persistence animations
+Progress Bar
+Instead of a standard progress bar:
+Animated gradient
+Moving particles
+Progress milestones
+Smooth interpolation
+Timer
+Circular animated countdown
+Color changes near completion
+Pulse animation below 30%
+Shake effect below 10%
+
+Assessment Experience
+Question Transition
+When moving to next question:
+Slide out current question
+Fade transition
+Smooth content reveal
+Duration:
+300ms–500ms
+Answer Submission
+Show:
+Validation animation
+Processing effect
+Success state
+Avoid instant page changes.
+
+Results Screen
+Create a highly engaging AI-powered results page.
+Score Reveal
+Use:
+Counter animation
+Circular progress reveal
+Confetti for high scores
+Dynamic celebration effects
+AI Feedback
+Generate feedback using Gemini:
+Example:
+"Your React fundamentals are strong. You performed exceptionally well in state management and component lifecycle questions. Consider improving your understanding of performance optimization and memoization techniques."
+Visual Insights
+Display:
+Topic-wise breakdown
+Strength areas
+Improvement areas
+Accuracy percentage
+Time spent analysis
+
+Design Requirements
+Look & Feel
+Modern AI SaaS aesthetic inspired by:
+OpenAI
+Perplexity
+Linear
+Vercel
+Notion AI
+Cursor
+Visual Style
+Glassmorphism
+Soft gradients
+Floating panels
+Clean typography
+Premium interactions
+Color System
+Support:
+Light Mode
+Dark Mode
+with smooth theme transitions.
+
+Technical Requirements
+Frontend
+React
+TypeScript
+Tailwind CSS
+Framer Motion
+State Management
+Zustand or Redux Toolkit
+API Layer
+Google Gemini API
+Modular service architecture
+Caching
+Cache generated questions:
+Session Storage
+Local Storage
+API Cache Layer
+to avoid regenerating identical assessments.
+
+Performance Requirements
+All animations should run at 60 FPS.
+No animation should block user interaction.
+Lazy load heavy components.
+Optimize Gemini requests.
+Show skeleton loaders while fetching.
+
+Deliverables
+Implement:
+Google Gemini integration for dynamic MCQ generation.
+AI-generated personalized assessments.
+Rich micro-interactions across the application.
+AI-powered loading experience.
+Animated assessment flow.
+Premium results dashboard.
+Scalable architecture for future question types.
+Clean, production-ready code following best practices.
+Responsive design for desktop, tablet, and mobile.
+Modular component structure with reusable animation primitives.
